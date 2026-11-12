@@ -1,0 +1,129 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>VisionAI</title>
+<style>
+:root{--bg:#0f1317;--card:#1a2027;--ac:#4fe3b0;--ac2:#9fb3c4;--tx:#eef2f5;--hi:#ffe14d}
+*{box-sizing:border-box}body{margin:0;padding:14px;min-height:100vh;color:var(--tx);font:600 19px/1.4 "Trebuchet MS",system-ui,sans-serif;background:var(--bg)}
+h1{margin:0 0 12px;font-size:30px;letter-spacing:.5px}h1 span{color:var(--ac)}
+.card{background:var(--card);border:2px solid #2b343e;border-radius:22px;padding:14px;margin-bottom:12px}
+select,input,button{width:100%;font:inherit;padding:16px;border-radius:14px;border:3px solid #34414e;background:#0f1317;color:var(--tx);margin:6px 0}
+button{background:var(--ac);border-color:var(--ac);color:#06241a;font-weight:800;font-size:23px}
+select:focus,button:focus,input:focus{outline:4px solid #fff}
+#stage{position:relative;height:100vh;height:100dvh;margin:-14px -14px 14px;background:#000;overflow:hidden}canvas{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;background:#000}#hud{position:absolute;left:0;right:0;top:0;padding:14px;background:linear-gradient(#000d,#0000)}#hud h1{margin:0 0 4px}
+#st{font-size:20px;color:var(--ac2)}#say{position:absolute;left:0;right:0;bottom:0;padding:18px 14px 26px;font-size:26px;min-height:70px;color:var(--hi);background:linear-gradient(#0000,#000e)}#dev{display:none}
+</style></head><body>
+<div id="stage"><canvas id="c" width="640" height="480"></canvas><div id="hud"><h1><span>Vision</span>AI</h1><div id="st">Scroll down to choose camera and language</div></div><div id="say" aria-live="assertive"></div></div>
+<div class="card" id="setup">
+<label for="cam">Camera</label>
+<select id="cam"><option value="environment">Phone back camera</option><option value="user">Front / laptop webcam</option><option value="esp">ESP32-CAM (spectacles)</option></select>
+<input id="ip" value="http://192.168.4.1:81/stream" style="display:none" aria-label="ESP32 stream URL">
+<label for="lang">Language</label>
+<select id="lang"><option value="hn">Hinglish</option><option value="hi">Hindi</option><option value="en">English</option></select>
+<button id="go">▶ Start camera</button></div>
+
+<div class="card" id="dev">Dev calibration (?dev=1)<br>Focal<input type="range" min=".5" max="1.6" step=".01" value=".95" oninput="C.F=+this.value">Match threshold<input type="range" min=".3" max=".95" step=".01" value=".62" oninput="C.THR=+this.value">Wall sensitivity<input type="range" min="1" max="15" step=".5" value="5" oninput="C.WALL=+this.value"></div>
+<img id="esp" crossorigin="anonymous" hidden alt=""><video id="v" playsinline muted hidden></video>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.1/dist/mobilenet.min.js"></script>
+<script>
+/* ===== PROGRAMMER CONFIG ===== F=camera focal (x frame height), THR=photo match, WALL=flat-surface sensitivity, REPO='owner/repo' if auto-detect fails */
+const C={F:.95,THR:.62,WALL:5,REPO:''};
+const $=i=>document.getElementById(i),c=$('c'),x=c.getContext('2d'),fc=document.createElement('canvas'),fx=fc.getContext('2d'),sm=document.createElement('canvas'),mx=sm.getContext('2d',{willReadFrequently:true}),tc=document.createElement('canvas'),tx=tc.getContext('2d');
+fc.width=640;fc.height=480;sm.width=64;sm.height=48;tc.width=tc.height=224;
+if(location.search.includes('dev'))$('dev').style.display='block';
+$('cam').onchange=()=>$('ip').style.display=$('cam').value=='esp'?'block':'none';
+const V=['car','truck','bus','motorcycle','bicycle'];
+const H={person:1.65,chair:.9,bottle:.25,cup:.1,couch:.85,bed:.6,'dining table':.75,tv:.5,laptop:.25,'cell phone':.15,book:.2,car:1.5,truck:3,bus:3,motorcycle:1.2,bicycle:1,dog:.5,cat:.3,'potted plant':.5,backpack:.5,umbrella:.8,bench:.5,refrigerator:1.7,suitcase:.6};
+// names: [English, Hinglish, Hindi, ...extra spoken aliases]
+const N={wall:['wall','deewar','दीवार'],person:['person','vyakti','व्यक्ति','aadmi','insaan'],chair:['chair','kursi','कुर्सी'],bottle:['bottle','bottel','बोतल','बॉटल','pani'],cup:['cup','cup','कप','glass','gilas','गिलास'],couch:['sofa','sofa','सोफा'],bed:['bed','bed','बिस्तर','bistar'],'dining table':['table','table','मेज़','mez'],tv:['TV','TV','टीवी','television'],laptop:['laptop','laptop','लैपटॉप'],'cell phone':['phone','phone','फ़ोन','फोन','mobile'],book:['book','kitaab','किताब','kitab'],car:['car','car','कार','gaadi'],truck:['truck','truck','ट्रक'],bus:['bus','bus','बस'],motorcycle:['bike','bike','बाइक','motorcycle'],bicycle:['cycle','cycle','साइकिल','bicycle'],dog:['dog','kutta','कुत्ता'],cat:['cat','billi','बिल्ली'],'potted plant':['plant','gamla','गमला'],refrigerator:['fridge','fridge','फ्रिज']};
+let cur=0,lang='hn',src,coco,mob,rec,on=0,busy=0,mode='idle',dets=[],boxes=[],hv=[],wc=0,lc=0,R=[],K=new Map(),HT={},last={};
+const li=()=>({en:0,hn:1,hi:2})[lang],VL={en:'en-IN',hn:'en-IN',hi:'hi-IN'},st=t=>$('st').textContent=t;
+const en=k=>{const a=N[k];return a?a[0]:k.replace(/_/g,' ')},nm=k=>({toString:()=>{const a=N[k];return a?a[cur]||a[0]:k.replace(/_/g,' ')}});
+const ds=d=>({toString:()=>d<.4?['very close','bahut paas','बहुत पास'][cur]:d.toFixed(1)+' '+['meters','meter','मीटर'][cur]});
+const P={left:['on your left','bayein taraf','बाईं तरफ'],front:['in front','saamne','सामने'],right:['on your right','daayein taraf','दाईं तरफ']};
+const T={
+ready:['Ready. Say start.','Taiyaar hoon. Start bolo.','तैयार हूँ। स्टार्ट बोलिए।'],
+go:['Started. I will warn you about obstacles.','Shuru. Rukawat aane par bataunga.','शुरू। रुकावट आने पर बताऊँगा।'],
+stop:['Paused. Say start to resume.','Ruk gaya. Phir se start bolo.','रुक गया। फिर स्टार्ट बोलिए।'],
+huh:['Sorry, I did not understand.','Samajh nahi aaya, dobara bolo.','समझ नहीं आया, दोबारा बोलिए।'],
+nf:['Not found.','Nahi mila.','नहीं मिला।'],
+obs:[(n,d)=>`${n} ahead, ${d}`,(n,d)=>`${n} aage hai, ${d} door`,(n,d)=>`${n} आगे है, ${d} दूर`],
+near:[n=>`${n} ahead, within one meter`,n=>`${n} aage, ek meter ke andar`,n=>`${n} आगे, एक मीटर के अंदर`],
+veh:[n=>`Danger! ${n} coming fast towards you`,n=>`Savdhan! ${n} tezi se aa raha hai`,n=>`सावधान! ${n} तेज़ी से आ रहा है`],
+at:[(n,p,d)=>`${n} ${p}${d?', '+d+' away':''}`,(n,p,d)=>`${n} ${p} hai${d?', '+d+' door':''}`,(n,p,d)=>`${n} ${p} है${d?', '+d+' दूर':''}`],
+is:[n=>`This is ${n}`,n=>`Ye ${n} hai`,n=>`यह ${n} है`],
+cur:[(v,t)=>`This is a ${v} rupee ${t}`,(v,t)=>`Ye ${v} rupaye ka ${t=='note'?'note':'sikka'} hai`,(v,t)=>`यह ${v} रुपये का ${t=='note'?'नोट':'सिक्का'} है`],
+nofolder:[n=>`No photos in ${n} folder`,n=>`${n} folder mein photo nahi hai`,n=>`${n} फ़ोल्डर में फोटो नहीं है`]};
+const S=(k,...a)=>{const g=i=>{cur=i;const v=T[k][i];return typeof v=='function'?v(...a):v};const sp=g(li());S.d=g(0);cur=li();return sp};
+/* ---- speech out / in ---- */
+function say(t,key,cd,urg){const n=Date.now();if(key){if(n-(last[key]||0)<cd)return;last[key]=n}$('say').textContent=S.d||t;if(urg)speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.lang=VL[lang];u.onstart=()=>{busy=1;try{rec&&rec.stop()}catch(e){}};u.onend=u.onerror=()=>{busy=0;listen()};speechSynthesis.speak(u)}
+function listen(){if(on&&rec&&!busy)try{rec.start()}catch(e){}}
+/* ---- voice command understanding ---- */
+function key(t){let b=null;for(const[a,v]of K)if(t.includes(a)&&(!b||a.length>b[0].length))b=[a,v];return b&&b[1]}
+function cmd(t){st('🎤 '+t);
+ if(/\b(stop|ruko|band|rukiye)\b|रुको|बंद/.test(t)){mode='idle';return say(S('stop'),0,0,1)}
+ if(mode=='idle'){if(/start|shuru|chalu|शुरू|चालू|स्टार्ट/.test(t)){mode='run';say(S('go'),0,0,1)}return}
+ if(/note|nots|sikk|coin|rupee|rupay|rupaye|\brs\b|paise|kitne ka|how much|नोट|सिक्क|रुपय|रुपए/.test(t))return ask('currency');
+ if(/board|sign|likha|padh|बोर्ड|साइन|पढ़/.test(t))return ask('signs');
+ const k=key(t);if(k)return find(k);
+ if(/product|saman|samaan|packet|cheez|kya hai|what is|what's|प्रोडक्ट|सामान|पैकेट|चीज़|क्या है/.test(t))return ask('products');
+ say(S('huh'),0,0,1)}
+/* ---- photo library: objects/<category>/<item>/<photo>.jpg ---- */
+function emb(el,a,b,w,h){tx.drawImage(el,a,b,w,h,0,0,224,224);const t=mob.infer(tc,true),d=t.dataSync();t.dispose();let n=0;for(const v of d)n+=v*v;n=Math.sqrt(n);return d.map(v=>v/n)}
+function best(e,fl){let b={s:-1};for(const f of R)if(fl(f)){let s=0;for(let i=0;i<e.length;i++)s+=e[i]*f.e[i];if(s>b.s)b={s,f}}return b}
+async function loadRefs(){let files=[],al={};
+ try{al=await(await fetch('objects/aliases.json')).json()}catch(e){}
+ const rp=C.REPO||location.hostname.split('.')[0]+'/'+location.pathname.split('/')[1];
+ for(const b of['main','master']){try{const j=await(await fetch(`https://api.github.com/repos/${rp}/git/trees/${b}?recursive=1`)).json();if(j.tree){files=j.tree.map(f=>f.path);break}}catch(e){}}
+ if(!files.length)try{files=await(await fetch('objects/manifest.json')).json()}catch(e){}
+ for(const[a,v]of Object.entries(N))for(const w of v)K.set(w.toLowerCase(),{t:'coco',c:a});
+ for(const p of files){const m=p.match(/^objects\/([^\/]+)\/([^\/]+)\/[^\/]+\.(jpe?g|png|webp)$/i);if(!m)continue;
+  st('Loading photos '+(R.length+1)+'/'+files.length);
+  try{const im=new Image();im.src=encodeURI(p);await im.decode();const[,cat,n]=m;R.push({cat,n,e:emb(im,0,0,im.naturalWidth,im.naturalHeight)});
+   if(cat!='currency'&&cat!='signs'){const a=al[n]||[],l=a.alias||a;if(a.h)HT[n]=a.h/100;for(const w of[n.replace(/_/g,' '),...l])K.set(w.toLowerCase(),{t:'ref',cat,n})}}catch(e){}}}
+function ask(cat){if(!R.some(f=>f.cat==cat))return say(S('nofolder',cat),0,0,1);
+ let b={s:-1};for(const r of[[80,60,480,360],[0,0,640,480],[160,120,320,240]]){const q=best(emb(fc,...r),f=>f.cat==cat);if(q.s>b.s)b=q}
+ if(b.s<C.THR)return say(S('nf'),0,0,1);
+ const n=b.f.n,m=n.match(/(note|coin|sikka)_?(\d+)/i);
+ say(cat=='currency'&&m?S('cur',m[2],/note/i.test(m[1])?'note':'coin'):S('is',nm(n)),0,0,1)}
+const dist=(b,cl)=>{const h=H[cl]||HT[cl];if(!h)return null;const d=h*C.F*480/b[3];return b[3]>.85*480?Math.min(d,.5):d};
+const mk=(o,d)=>({b:o.bbox,l:en(o.class)+(d!=null?' '+d.toFixed(1)+'m':''),t:Date.now()});
+function find(k){let hit=null;
+ if(k.t=='coco'){hit=dets.filter(o=>o.class==k.c).sort((a,b)=>b.score-a.score)[0]}
+ else{let b={s:-1};for(const bb of[...dets.map(o=>o.bbox),[0,0,213,480],[213,0,214,480],[427,0,213,480],[80,60,480,360]]){if(bb[2]<20||bb[3]<20)continue;const q=best(emb(fc,...bb),f=>f.cat==k.cat&&f.n==k.n);if(q.s>b.s)b={s:q.s,bb}}
+  if(b.s>=C.THR)hit={bbox:b.bb,class:k.n}}
+ if(!hit)return say(S('nf'),0,0,1);
+ const cl=k.t=='coco'?k.c:k.n,cx=hit.bbox[0]+hit.bbox[2]/2,d=dist(hit.bbox,cl),sd=cx<213?'left':cx>427?'right':'front',pos={toString:()=>P[sd][cur]};
+ boxes=[mk(hit,d)];say(S('at',nm(cl),pos,d!=null?ds(d):''),0,0,1)}
+/* ---- wall / big flat surface heuristic ---- */
+function flat(){mx.drawImage(fc,160,100,320,280,0,0,64,48);const d=mx.getImageData(0,0,64,48).data;let g=0,b=0;for(let i=0;i<47;i++)for(let j=0;j<63;j++){const p=(i*64+j)*4;g+=Math.abs(d[p]-d[p+4])+Math.abs(d[p]-d[p+256]);b+=d[p]}return g/2961<C.WALL&&b/2961>25}
+/* ---- obstacle loop (silent unless danger within 1 m, or vehicle approaching) ---- */
+async function loop(){if(mode=='run')try{
+ dets=await coco.detect(fc,10,.45);const t=Date.now(),nb=[];hv=hv.filter(p=>t-p.t<1200);
+ for(const o of dets){const d=dist(o.bbox,o.class);if(d==null)continue;const[x0,,w,h]=o.bbox,cx=x0+w/2,inP=x0+w>192&&x0<448;
+  if(V.includes(o.class)){const p=hv.find(p=>p.c==o.class&&t-p.t>300&&Math.abs(p.cx-cx)<120);
+   if(p&&inP&&d<15&&(h/p.h-1)/((t-p.t)/1000)>.5){say(S('veh',nm(o.class)),'v'+o.class,2500,1);nb.push(mk(o,d))}hv.push({c:o.class,cx,h,t})}
+  else if(d<=1&&inP){nb.push(mk(o,d));say(S('obs',nm(o.class),ds(d)),o.class,5000)}}
+ if(!nb.length){wc=flat()?wc+1:0;if(wc>=3){nb.push({b:[160,100,320,280],l:'wall',t});say(S('near',nm('wall')),'wall',6000)}
+  else if(++lc%5==0&&R.some(f=>f.cat=='obstacles')){const q=best(emb(fc,160,100,320,280),f=>f.cat=='obstacles');if(q.s>=C.THR+.05){nb.push({b:[160,100,320,280],l:en(q.f.n),t});say(S('near',nm(q.f.n)),q.f.n,6000)}}}
+ if(nb.length)boxes=nb}catch(e){}
+ setTimeout(loop,100)}
+function put(){const w=src.videoWidth||src.naturalWidth||640,h=src.videoHeight||src.naturalHeight||480,k=Math.min(640/w,480/h),dw=w*k,dh=h*k;fx.fillStyle='#000';fx.fillRect(0,0,640,480);fx.drawImage(src,(640-dw)/2,(480-dh)/2,dw,dh)}
+function draw(){try{put()}catch(e){}x.drawImage(fc,0,0);const t=Date.now();x.lineWidth=5;x.font='bold 28px sans-serif';
+ for(const o of boxes)if(t-o.t<1500){x.strokeStyle='#ffe14d';x.strokeRect(...o.b);x.fillStyle='#ffe14d';x.fillRect(o.b[0],o.b[1]-36,x.measureText(o.l).width+14,36);x.fillStyle='#1a1500';x.fillText(o.l,o.b[0]+7,o.b[1]-9)}
+ requestAnimationFrame(draw)}
+/* ---- camera picker: exact facing mode, then label search (back/rear) ---- */
+async function getCam(m){const g=v=>navigator.mediaDevices.getUserMedia({video:v,audio:false});
+ try{return await g({facingMode:{exact:m},width:{ideal:1280},height:{ideal:720}})}catch(e){}
+ let s=await g({facingMode:m,width:{ideal:1280},height:{ideal:720}});
+ try{const re=m=='user'?/front|user|selfie/i:/back|rear|environment/i,ds=(await navigator.mediaDevices.enumerateDevices()).filter(d=>d.kind=='videoinput'&&re.test(d.label));
+  if(ds.length&&s.getVideoTracks()[0].getSettings().facingMode!=m){s.getTracks().forEach(t=>t.stop());s=await g({deviceId:{exact:(ds.find(d=>/wide/i.test(d.label))||ds[0]).deviceId}})}}catch(e){}
+ return s}
+/* ---- start ---- */
+$('go').onclick=async()=>{lang=$('lang').value;cur=li();speechSynthesis.cancel();st('Loading… please wait');window.scrollTo({top:0,behavior:'smooth'});
+ try{const m=$('cam').value;if(m=='esp'){src=$('esp');src.src=$('ip').value}else{$('v').srcObject=await getCam(m);try{const tr=$('v').srcObject.getVideoTracks()[0],z=tr.getCapabilities().zoom;if(z)await tr.applyConstraints({advanced:[{zoom:z.min}]})}catch(e){}await $('v').play();src=$('v')}}catch(e){return st('Camera error: '+e.message)}
+ [coco,mob]=await Promise.all([cocoSsd.load({base:'lite_mobilenet_v2'}),mobilenet.load({version:2,alpha:1})]);
+ await loadRefs();
+ const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+ if(SR){rec=new SR();rec.lang=VL[lang];rec.continuous=true;rec.onresult=e=>{const r=e.results[e.results.length-1];if(r.isFinal)cmd(r[0].transcript.toLowerCase())};rec.onend=()=>{if(!busy&&on)try{rec.start()}catch(e){}}}else st('Voice not supported - use Chrome');
+ on=1;draw();loop();st('Say "start"');say(S('ready'),0,0,1)};
+</script></body></html>
